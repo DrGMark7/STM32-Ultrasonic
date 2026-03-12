@@ -1,132 +1,212 @@
-# STM32 Ultrasonic Distance Sender
+# Tesla Model X Embedded System Project
 
-Firmware for an `STM32L432KC` (`NUCLEO-L432KC`) that reads distance from an HC-SR04-style ultrasonic sensor, smooths the result with a moving average filter, prints the measurement over UART, and sends the distance to an ESP32 over I2C.
+Integrated embedded project for a small vehicle platform built from three cooperating controllers:
 
-## Overview
+- `ESP32-Remote` handles the handheld controller UI, motion sensing, joystick input, and `ESP-NOW` command transmission.
+- `Tesla-X1` runs on the vehicle-side ESP32 and controls motors, buzzer state, and emergency braking logic.
+- `STM32-Ultrasonic` measures obstacle distance with an ultrasonic sensor and forwards that value to the vehicle controller over `I2C`.
 
-The application does the following in a loop:
+## System Overview
 
-- Triggers the ultrasonic sensor with a 10 us pulse.
-- Measures the ECHO pulse width using `TIM2` as a 1 MHz free-running timer.
-- Converts pulse width to centimeters with `distance_cm = echo_us / 58`.
-- Applies a 5-sample moving average filter.
-- Sends the filtered distance to an ESP32 over I2C.
-- Prints status and distance messages over `USART2` at `115200` baud.
+![Vehicle wiring and controller flow](./assets/CarDiagram.png)
 
-If the measurement times out or falls outside the configured range, the firmware reports `OUT OF RANGE` over UART and transmits `9999` over I2C.
+The system is split into a wireless control path and a wired safety path:
 
-## Hardware
+1. The remote ESP32 reads joystick, buttons, and MPU6050 tilt data.
+2. The remote sends gear, safety, horn, and drive packets to the vehicle over `ESP-NOW`.
+3. The STM32 continuously measures obstacle distance with an HC-SR04 style sensor.
+4. The STM32 transmits distance data to the vehicle ESP32 over `I2C`.
+5. The vehicle ESP32 drives the motors and applies an emergency stop if safety mode is enabled and an obstacle is too close.
 
-Target MCU and board:
+## Remote Controller
 
-- MCU: `STM32L432KCUx`
+![Remote controller layout](./assets/RemoteDiagram.png)
+
+Main implementation: [final.py](/Users/drgmark7/Desktop/Code/Tesla-Model-X-All-part/ESP32-Remote/final.py)
+
+Current remote behavior:
+
+- Runs on MicroPython with `espnow`, `network`, `machine`, `ssd1306`, and a local `mpu6050` driver
+- Uses MPU6050 roll angle as steering input
+- Uses joystick throttle for forward power
+- Toggles between `N` and drive mode with a gear button
+- Switches between `D` and `S` while in drive mode
+- Uses a separate lever input to enter reverse
+- Sends horn and safety toggles to the car
+- Draws a live UI on a `128x64` OLED
+
+Packet types sent by the remote:
+
+- `0`: gear update
+- `1`: safety mode update
+- `2`: driving data payload
+- `3`: horn / buzzer state
+
+`DrivingData` payload on the car side:
+
+```cpp
+struct DrivingData {
+    float angle;
+    int power;
+};
+```
+
+## Vehicle Controller
+
+Vehicle firmware lives in [main.cpp](/Users/drgmark7/Desktop/Code/Tesla-Model-X-All-part/Tesla-X1/src/main.cpp) with configuration in [config.h](/Users/drgmark7/Desktop/Code/Tesla-Model-X-All-part/Tesla-X1/src/config.h).
+
+Responsibilities:
+
+- Receive remote commands over `ESP-NOW`
+- Drive two DC motors with PWM and direction pins
+- Listen for 4-byte distance updates from the STM32 over `I2C` address `0x08`
+- Engage an emergency brake when safety mode is on and distance is below `STOP_DISTANCE`
+- Send emergency-brake feedback back to the remote peer
+
+Current vehicle pin mapping:
+
+| Function    | GPIO |
+| ----------- | ---: |
+| I2C SDA     |   21 |
+| I2C SCL     |   22 |
+| Motor 1 PWM |    4 |
+| Motor 1 IN1 |   17 |
+| Motor 1 IN2 |   16 |
+| Motor 2 PWM |   19 |
+| Motor 2 IN1 |    5 |
+| Motor 2 IN2 |   18 |
+| Buzzer      |   23 |
+
+Drive behavior:
+
+- `N`: motor outputs off
+- `D`: forward with smoothed acceleration and braking
+- `S`: forward with immediate target PWM response
+- `R`: reverse
+
+Safety behavior:
+
+- Distance values are stored in `globalDistance`
+- If safety mode is enabled and the gear is `D` or `S`, the car checks obstacle distance
+- If distance is greater than `1 cm` and less than `STOP_DISTANCE` (`5 cm`), both motors are electrically braked and PWM is set to zero
+
+## Ultrasonic Sensor Node
+
+STM32 firmware entry point: [main.c](/Users/drgmark7/Desktop/Code/Tesla-Model-X-All-part/STM32-Ultrasonic/Core/Src/main.c)
+
+Current STM32 behavior:
+
+- Generates a `10 us` trigger pulse for the ultrasonic sensor
+- Measures echo width using `TIM2`
+- Converts pulse width to centimeters
+- Applies a 5-sample moving average filter
+- Sends the filtered distance to the vehicle ESP32 over `I2C`
+- Prints status over `USART2` at `115200`
+
+Key STM32 hardware assumptions:
+
 - Board: `NUCLEO-L432KC`
-- Clock: `32 MHz` system clock
+- MCU: `STM32L432KCUx`
+- Trigger pin: `PA0`
+- Echo pin: `PA1`
+- UART TX: `PA2`
+- UART RX: `PA15`
+- I2C SCL: `PB6`
+- I2C SDA: `PB7`
 
-Main interfaces used by the project:
+Distance transport format:
 
-- Ultrasonic sensor trigger: `PA0`
-- Ultrasonic sensor echo: `PA1`
-- UART debug TX: `PA2`
-- UART debug RX: `PA15`
-- I2C1 SCL: `PB6`
-- I2C1 SDA: `PB7`
+- 4-byte little-endian unsigned integer
+- Value is distance in centimeters
+- `9999` means invalid or out of range
 
-Expected peripherals:
+## Repository Layout
 
-- HC-SR04 or compatible ultrasonic sensor
-- ESP32 configured as an I2C device at address `0x08`
+```text
+.
+|-- assets/
+|-- ESP32-Remote/
+|   |-- final.py
+|   |-- mpu6050.py
+|   `-- ssd1306.py
+|-- STM32-Ultrasonic/
+|   |-- Core/
+|   |-- Drivers/
+|   |-- CMakeLists.txt
+|   `-- README.md
+`-- Tesla-X1/
+    |-- src/
+    |-- platformio.ini
+    `-- README.md
+```
 
-## Firmware Behavior
+## Build And Flash
 
-Important constants from the current implementation:
+### 1. Vehicle ESP32 (`Tesla-X1`)
 
-- I2C target address: `0x08` (`0x10` in STM32 HAL 8-bit shifted form)
-- UART baud rate: `115200`
-- Filter size: `5`
-- Echo timeout: `38000 us`
-- Max distance clamp: `400 cm`
-- Measurement interval: `100 ms`
+Requirements:
 
-Startup messages:
+- PlatformIO Core or VS Code with the PlatformIO extension
+- ESP32 development board connected over USB
 
-- `System Ready`
-- `ESP32 Found!` or `ESP32 NOT Found`
+Commands:
 
-I2C payload format:
+```bash
+cd Tesla-X1
+pio run
+pio run -t upload
+pio device monitor -b 115200
+```
 
-- 4 bytes
-- Little-endian unsigned integer
-- Value is the filtered distance in centimeters
-- `9999` indicates out-of-range or invalid measurement
-
-## Project Structure
-
-- [`test01.ioc`](/Users/drgmark7/Desktop/Code/STM32-Ultrsonic/test01.ioc): STM32CubeMX configuration
-- [`Core/Src/main.c`](/Users/drgmark7/Desktop/Code/STM32-Ultrsonic/Core/Src/main.c): application logic
-- [`Core/Inc/main.h`](/Users/drgmark7/Desktop/Code/STM32-Ultrsonic/Core/Inc/main.h): main header
-- [`CMakeLists.txt`](/Users/drgmark7/Desktop/Code/STM32-Ultrsonic/CMakeLists.txt): top-level build configuration
-- [`CMakePresets.json`](/Users/drgmark7/Desktop/Code/STM32-Ultrsonic/CMakePresets.json): preset-based configure/build flow
-- [`cmake/gcc-arm-none-eabi.cmake`](/Users/drgmark7/Desktop/Code/STM32-Ultrsonic/cmake/gcc-arm-none-eabi.cmake): ARM GCC toolchain definition
-- [`STM32L432XX_FLASH.ld`](/Users/drgmark7/Desktop/Code/STM32-Ultrsonic/STM32L432XX_FLASH.ld): linker script
-
-## Build
+### 2. STM32 ultrasonic node (`STM32-Ultrasonic`)
 
 Requirements:
 
 - `CMake >= 3.22`
 - `Ninja`
-- `arm-none-eabi-gcc` toolchain available in `PATH`
+- `arm-none-eabi-gcc`
 
-Configure and build a debug image:
+Commands:
 
-```sh
+```bash
+cd STM32-Ultrasonic
 cmake --preset Debug
 cmake --build --preset Debug
 ```
 
-Configure and build a release image:
+Flash with your usual STM32 tooling such as STM32CubeProgrammer, `st-flash`, or `openocd`.
 
-```sh
-cmake --preset Release
-cmake --build --preset Release
-```
+### 3. Remote ESP32 (`ESP32-Remote`)
 
-Build output:
+Requirements:
 
-- ELF: `build/Debug/test01.elf` or `build/Release/test01.elf`
-- Map file: `build/<Preset>/test01.map`
+- ESP32 board flashed with MicroPython
+- MicroPython file upload workflow such as `mpremote`, Thonny, or ampy-compatible tooling
 
-## Flashing
+Files to deploy:
 
-This repository does not currently include a flashing script. Typical options are:
+- `final.py`
+- `mpu6050.py`
+- `ssd1306.py`
 
-- STM32CubeIDE / STM32CubeProgrammer
-- `st-flash`
-- `openocd`
+Before running, confirm the `peer` MAC address in [final.py](/Users/drgmark7/Desktop/Code/Tesla-Model-X-All-part/ESP32-Remote/final.py) matches the vehicle ESP32 MAC address, and confirm `REMOTE_ADDR` in [config.h](/Users/drgmark7/Desktop/Code/Tesla-Model-X-All-part/Tesla-X1/src/config.h) matches the remote.
 
-Example with `st-flash`:
+## Integration Notes
 
-```sh
-st-flash write build/Debug/test01.elf 0x8000000
-```
+- `ESP-NOW` is configured for Wi-Fi channel `1` on both ESP32 sides
+- The vehicle expects `I2C` address `0x08`
+- The remote and vehicle MAC addresses are currently hardcoded
+- The root repository includes generated build artifacts under `Tesla-X1/build/`; these are not source files
 
-Use the tool and image format that matches your local flashing setup.
+## Known Gaps
 
-## Regenerating Code
+- The remote setup does not yet have its own standalone README
+- Reverse behavior while safety mode is active is marked in source as needing debugging
+- No automated tests are included for any of the three firmware targets
+- `ESP-NOW` traffic is currently unencrypted
 
-The project was generated with STM32CubeMX using CMake as the target toolchain. If you regenerate code:
+## Member
 
-- Open [`test01.ioc`](/Users/drgmark7/Desktop/Code/STM32-Ultrsonic/test01.ioc) in STM32CubeMX or STM32CubeIDE.
-- Keep `ProjectManager.KeepUserCode=true` enabled.
-- Re-generate the project files.
-- Rebuild with CMake.
-
-User application logic is primarily in the `USER CODE` sections of [`Core/Src/main.c`](/Users/drgmark7/Desktop/Code/STM32-Ultrsonic/Core/Src/main.c).
-
-## Notes and Limitations
-
-- The ultrasonic measurement uses polling, not input capture interrupts.
-- The filter buffer starts at zero, so the first few readings are biased low until the buffer fills.
-- I2C transmission is performed as STM32 master transmit. The ESP32 side must be configured accordingly.
-- The code sends raw integer centimeters only; there is no checksum or framing beyond the 4-byte payload.
+- Napassakorn S. @DrGMark7
+- Phongsapak C. @reawphongsaphak
+- Sirapat P. @HUTZAKI
